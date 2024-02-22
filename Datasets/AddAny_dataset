@@ -1,0 +1,295 @@
+
+
+#from transformers import pipeline
+#from datasets import load_dataset
+#import evaluate
+
+question_answerer = pipeline("question-answering", model="arashmarioriyad/mbert_v3", tokenizer="arashmarioriyad/mbert_tokenizer_v3")
+
+# ### load small_persian_dataset
+
+org_dataset = load_dataset("Hamid-reza/small-persian-QA")
+metric = evaluate.load("squad")
+
+
+# ### load wiki_fa.vec from google drive for using in fasttext
+#get_ipython().system('pip install hazm gdown')
+#get_ipython().system('pip install --upgrade --no-cache-dir gdown')
+#get_ipython().system('gdown 1owT0PVR0LxVnWMcLZgozA-eM4qbEccSl')
+import numpy as np
+import pandas as pd 
+from hazm import *
+import numpy as np
+from tqdm.notebook import tqdm
+import codecs
+common_words = pd.read_csv('common_words.csv').words.tolist()
+from gensim.models.keyedvectors import KeyedVectors
+word_vectors_fa = KeyedVectors.load_word2vec_format('wiki.fa.vec')
+#get_ipython().system('pip install nltk')
+# ### some function to find similar words
+#توابع زیر برای تشخیص کلمات مشابه هم جهت جلوگیری از بدست اوردن کلمات هم‌خانواده یا هم ریشه است. مانند (بود و بودند) 
+from nltk import ngrams
+def same_root(word1, word2, n=3):
+    # Extract n-grams of the words
+    word1_ngrams = set(ngrams(word1, n, pad_left=True, pad_right=True))
+    word2_ngrams = set(ngrams(word2, n, pad_left=True, pad_right=True))
+
+    # Compare the n-grams of the words
+    common_ngrams = word1_ngrams & word2_ngrams
+    return len(common_ngrams) / len(word1_ngrams | word2_ngrams)
+
+def rec_diff(word1, word2):
+    score = same_root(word1, word2)
+    if score >= 0.2:
+        return False
+    return True
+
+# بدست اوردن کلمات مشابه با استفاده از fasttext
+def find_similar_words(target_word):
+
+    similar_words = word_vectors_fa.most_similar(target_word, topn=100)
+    filtered_words = [word for word, score in similar_words if  rec_diff(word, target_word)]
+    
+    return filtered_words[:20]
+
+def create_similar_dict(question_words, word_list):
+    similar_dic = {}
+    for i in word_list:
+        try:
+          similar_dic[i] = find_similar_words(i) + question_words
+        except KeyError:
+            similar_dic[i] = question_words
+    return similar_dic
+
+  
+def change_sentence(w, similar_dic, n=1):
+    candidates = []
+    change_index = np.random.choice(10, size=n)
+    #change_value = np.random.choice(3, size=n)
+    for i in range(n):
+        change_value = np.random.choice(len(similar_dic[w[change_index[i]]]), size=1)
+        candidates.append(similar_dic[w[change_index[i]]][change_value[0]])
+        
+    
+    for i in range(n):
+        w[change_index[i]] = candidates[i]
+        
+    return ' '.join(w)
+
+
+# ### Genetic algorithm to find adversarial example
+
+import random
+def crossover(state1, state2):
+    # cross both strings, at a random point
+    cut_point = random.randint(0, len(state1))
+    child = state1[:cut_point] + state2[cut_point:]
+    return child
+
+
+def compute_f1(prediction, answer):
+    pred_tokens = prediction.split()
+    answer_tokens = answer.split()
+    
+    if len(pred_tokens) == 0 or len(answer_tokens) == 0:
+        return int(pred_tokens == answer_tokens)
+    
+    common_tokens = set(pred_tokens) & set(answer_tokens)
+    
+    if len(common_tokens) == 0:
+        return 0
+    
+    prec = len(common_tokens) / len(pred_tokens)
+    rec = len(common_tokens) / len(answer_tokens)
+    
+    return 2 * (prec * rec) / (prec + rec)
+
+
+
+def genetic(question_words, common_words, context_text, population_size=6, generations=10, mutation_rate=0.3):
+    eps = 1e-3
+    similar_dict = {}
+    words = common_words + question_words
+    similar_dict =  create_similar_dict(question_words, words)
+
+    question_text = ' '.join(question_words)
+    answer = question_answerer(context=context_text, question=question_text)['answer']
+    common_words += question_words
+    start_state = []
+    for i in range(population_size):
+        choices = np.random.choice(len(common_words), size=10)
+        common_words_np = np.array(common_words)
+        W = common_words_np[choices]
+        start_state.append(W.tolist()) # append list of common words
+    
+    flag = True
+    counter = 0
+    min_f1 = 1
+    min_f1_words = []
+    #print(start_state)
+    while counter <2 :
+        
+        evaluations = []
+        for i in start_state:
+            
+            f1 = compute_f1(question_answerer(context=(context_text+' '.join(i)), question=question_text)['answer'],answer) #evaluate_function of QA with append i to paragraph then compute f1 score of model and return f1
+            #print(f1)
+            if f1 == 0:
+                return i 
+            if f1 < min_f1:
+                min_f1_words = i
+                min_f1 = f1
+                #print('min' + str(f1))
+            evaluations.append(1-f1+eps) # 1 - f1
+        
+        #print(start_state)
+
+        total_scores = np.sum(np.array(evaluations))
+        population_probs = np.array(evaluations) / total_scores
+
+        #selection
+        population_after_selection = [random.choices(start_state, weights=population_probs)[0] for _ in range(population_size)]
+
+        #cross_over
+        next_generation = []
+        for i in range(0,population_size-1,2):
+            next_generation.append(crossover(population_after_selection[i],population_after_selection[i+1]))
+            next_generation.append(crossover(population_after_selection[i+1],population_after_selection[i]))
+
+  
+        
+        #mutate
+        for i in range(len(next_generation)):
+            if random.random() < mutation_rate:
+              try:
+                choice1 = np.random.choice(len(next_generation[i]), size=1)
+                choice2 = np.random.choice(len(similar_dict[next_generation[i][choice1[0]]]), size=1)
+                next_generation[i][choice1[0]] = similar_dict[next_generation[i][choice1[0]]][choice2[0]]
+              except:
+                continue
+        #print(next_generation)
+        start_state = next_generation
+    
+        counter += 1
+    
+    
+    return min_f1_words
+    
+
+# ### create advarsarial examples for test set
+conts_validation = []
+
+for i in tqdm(range(130)):
+  text = org_dataset['validation'][i]['context']
+  question_words = word_tokenize(org_dataset['validation'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_validation.append(text)
+
+df_train = pd.DataFrame(conts_validation, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output(1).csv', encoding = 'utf-8-sig') 
+files.download('output(1).csv')
+
+
+conts_train1 = []
+
+for i in tqdm(range(0, 200)):
+  text = org_dataset['train'][i]['context']
+  question_words = word_tokenize(org_dataset['train'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_train1.append(text)
+
+
+df_train = pd.DataFrame(conts_train1, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output_train_0_200.csv', encoding = 'utf-8-sig') 
+files.download('output_train_0_200.csv')
+
+
+conts_train2 = []
+
+for i in tqdm(range(200, 400)):
+  text = org_dataset['train'][i]['context']
+  question_words = word_tokenize(org_dataset['train'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_train2.append(text)
+
+
+df_train = pd.DataFrame(conts_train2, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output_train_200_400.csv', encoding = 'utf-8-sig') 
+files.download('output_train_200_400.csv')
+
+conts_train3 = []
+
+for i in tqdm(range(400, 600)):
+  text = org_dataset['train'][i]['context']
+  question_words = word_tokenize(org_dataset['train'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_train3.append(text)
+
+
+df_train = pd.DataFrame(conts_train3, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output_train_400_600.csv', encoding = 'utf-8-sig') 
+files.download('output_train_400_600.csv')
+
+conts_train4 = []
+
+for i in tqdm(range(600, 800)):
+  text = org_dataset['train'][i]['context']
+  question_words = word_tokenize(org_dataset['train'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_train4.append(text)
+
+df_train = pd.DataFrame(conts_train4, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output_train_600_800.csv', encoding = 'utf-8-sig') 
+files.download('output_train_600_800.csv')
+
+conts_train5 = []
+
+for i in tqdm(range(800, 1000)):
+  text = org_dataset['train'][i]['context']
+  question_words = word_tokenize(org_dataset['train'][i]['question'])
+  text = text + ' '.join(genetic(question_words, common_words, text))
+  conts_train5.append(text)
+
+df_train = pd.DataFrame(conts_train5, columns=['adv_context'])
+from google.colab import files
+df_train.to_csv('output_train_800_1000.csv', encoding = 'utf-8-sig') 
+files.download('output_train_800_1000.csv')
+
+df1 = pd.read_csv('output_train_0_200.csv')
+df2 = pd.read_csv('output_train_200_400.csv')
+df3 = pd.read_csv('output_train_400_600.csv')
+df4 = pd.read_csv('output_train_600_800.csv')
+df5 = pd.read_csv('output_train_800_1000.csv')
+
+train = []
+train.append(df1.adv_context.to_list()[:])
+train.append(df2.adv_context.to_list()[:])
+train.append(df3.adv_context.to_list()[:])
+train.append(df4.adv_context.to_list()[:])
+train.append(df5.adv_context.to_list()[:])
+train = np.array(train)
+train = train.ravel()
+len(train)
+
+org_dataset['train']
+
+final_train = pd.DataFrame(list(zip(org_dataset['train']['id'][:1000], org_dataset['train']['title'][:1000], train, org_dataset['train']['question'][:1000], org_dataset['train']['answers'][:1000])), columns=['id', 'title', 'context', 'question', 'answers'])
+
+df = pd.read_csv('output (1).csv')
+final_validation = pd.DataFrame(list(zip(org_dataset['validation']['id'], org_dataset['validation']['title'], df.adv_context, org_dataset['validation']['question'], org_dataset['validation']['answers'])), columns=['id', 'title', 'context', 'question', 'answers'])
+
+from datasets import Dataset, DatasetDict
+tds = Dataset.from_pandas(final_train)
+vds = Dataset.from_pandas(final_validation)
+ds = DatasetDict()
+ds['train'] = tds
+ds['validation'] = vds
+
+from huggingface_hub import notebook_login
+notebook_login()
+ds.push_to_hub("mohammadhossein/addany-dataset")
